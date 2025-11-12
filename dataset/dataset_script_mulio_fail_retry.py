@@ -38,25 +38,32 @@ def fetch_json(url, headers, retry=0):
         r = requests.get(url, headers=headers, timeout=60)
         if r.status_code == 200:
             return r.json()
+        elif r.status_code == 404:
+            return {"_error": "not_found"}
         elif r.status_code in (403, 429):
-            if retry < RETRY_LIMIT:
+            reset = r.headers.get("X-RateLimit-Reset")
+            remaining = r.headers.get("X-RateLimit-Remaining")
+            if remaining == "0" and reset:
+                sleep_time = int(reset) - int(time.time()) + 5
+                print(f"⚠️ Rate limit reached. Sleeping {sleep_time}s ...")
+                time.sleep(max(sleep_time, 10))
+            elif retry < RETRY_LIMIT:
                 time.sleep(2 ** retry)
                 return fetch_json(url, headers, retry + 1)
-            return None
+            return {"_error": f"rate_limit_or_forbidden_{r.status_code}"}
         else:
-            return None
-    except Exception:
+            return {"_error": f"status_{r.status_code}"}
+    except Exception as e:
         if retry < RETRY_LIMIT:
             time.sleep(2 ** retry)
             return fetch_json(url, headers, retry + 1)
-        return None
-
+        return {"_error": f"exception_{type(e).__name__}: {str(e)}"}
 
 def get_repo_info(repo_full_name):
     url = f"https://api.github.com/repos/{repo_full_name}"
     data = fetch_json(url, TOPICS_HEADERS)
-    if not data:
-        return None
+    if not data or "_error" in data:
+        return {"_error": data.get("_error") if data else "unknown_error"}
     return {
         "description": data.get("description"),
         "homepage_url": data.get("homepage"),
@@ -67,12 +74,17 @@ def get_repo_info(repo_full_name):
 def get_readme(repo_full_name):
     url = f"https://api.github.com/repos/{repo_full_name}/readme"
     data = fetch_json(url, HEADERS)
-    if not data or "content" not in data:
-        return None
+    if not data:
+        return {"_error": "no_response"}
+    if "_error" in data:
+        return {"_error": data["_error"]}
+    if "content" not in data:
+        return {"_error": "no_content_field"}
     try:
-        return base64.b64decode(data["content"]).decode("utf-8", errors="ignore")
-    except:
-        return None
+        text = base64.b64decode(data["content"]).decode("utf-8", errors="ignore")
+        return {"text": text}
+    except Exception as e:
+        return {"_error": f"decode_error_{type(e).__name__}"}
 
 
 def load_jsonl(file_path):
@@ -92,15 +104,23 @@ def process_repo(row, success_repo_ids):
     repo_name = row["repo_name"]
     repo_id = row["repo_id"]
     success = True
+    fail_reason = None
 
     info = get_repo_info(repo_name)
-    if not info:
+    if "_error" in info:
         success = False
+        fail_reason = info["_error"]
         info = {"description": None, "homepage_url": None, "topics": []}
 
-    readme_text = get_readme(repo_name)
-    if readme_text is None:
-        success = False
+    readme_data = get_readme(repo_name)
+    if "_error" in readme_data:
+        # 如果只是没有 README，不算失败
+        if readme_data["_error"] != "not_found":
+            success = False
+            fail_reason = readme_data["_error"]
+        readme_text = None
+    else:
+        readme_text = readme_data["text"]
 
     result = {
         "repo_id": repo_id,
@@ -110,7 +130,8 @@ def process_repo(row, success_repo_ids):
         "homepage_url": info["homepage_url"],
         "topics": info["topics"],
         "readme_text": readme_text,
-        "success": success
+        "success": success,
+        "fail_reason": fail_reason
     }
 
     with file_lock:
@@ -121,9 +142,11 @@ def process_repo(row, success_repo_ids):
                 with open(SUCCESS_FILE, "a", encoding="utf-8") as f_succ:
                     f_succ.write(json.dumps({"repo_id": repo_id, "repo_name": repo_name}, ensure_ascii=False) + "\n")
                 success_repo_ids.add(repo_id)
-        # 失败仓库由外层逻辑统一处理
+        else:
+            with open(FAILED_FILE, "a", encoding="utf-8") as f_fail:
+                f_fail.write(json.dumps(result, ensure_ascii=False) + "\n")
 
-    print(f"{repo_name}: {'✅ 成功' if success else '❌ 失败'}")
+    print(f"{repo_name}: {'✅ 成功' if success else '❌ 失败'} {f'({fail_reason})' if fail_reason else ''}")
     time.sleep(MIN_INTERVAL)
     return result
 
